@@ -28,6 +28,41 @@ MEAL_NORMALIZE = {
     "snacks": "Other",
 }
 
+# Unit conversions → grams (weight) or ml (volume). Covers the common weight
+# units callers want. Volume units are approximated as grams for solid foods;
+# accurate only for water-density liquids. `log_amount` falls back to the
+# food's metric gram serving, so grams are always the safe path.
+_WEIGHT_TO_G = {
+    "g": 1.0,
+    "gram": 1.0,
+    "grams": 1.0,
+    "oz": 28.3495,
+    "ounce": 28.3495,
+    "ounces": 28.3495,
+    "lb": 453.592,
+    "lbs": 453.592,
+    "pound": 453.592,
+    "pounds": 453.592,
+    "kg": 1000.0,
+}
+_VOLUME_TO_ML = {
+    "ml": 1.0,
+    "l": 1000.0,
+    "liter": 1000.0,
+    "liters": 1000.0,
+    "floz": 29.5735,
+    "fl_oz": 29.5735,
+    "fluid_ounce": 29.5735,
+    "tbsp": 14.7868,
+    "tablespoon": 14.7868,
+    "tablespoons": 14.7868,
+    "tsp": 4.92892,
+    "teaspoon": 4.92892,
+    "teaspoons": 4.92892,
+    "cup": 236.588,
+    "cups": 236.588,
+}
+
 
 def build_server() -> FastMCP:
     cfg = Config.load()
@@ -184,6 +219,114 @@ def _register_tools(mcp: FastMCP, client: Client) -> None:
             f"logged (food_entry_id={fe_id}) {servings}× '{serving_desc}' of "
             f"{food_entry_name} to {meal_key} on {date or 'today'} "
             f"(sent number_of_units={api_units})"
+        )
+
+    @mcp.tool()
+    def log_amount(
+        food_id: str,
+        amount: float,
+        unit: str = "g",
+        meal: str = "Breakfast",
+        date: str = "",
+        food_entry_name: str = "",
+    ) -> str:
+        """Log a food by absolute amount + unit — no need to pre-pick a serving.
+
+        amount: how much (2.5, 100, etc.)
+        unit:   g | oz | lb | kg  (weight)
+                ml | fl_oz | tbsp | tsp | cup  (volume; approximate for solids)
+        meal:   Breakfast | Lunch | Dinner | Other (snack → Other)
+        date:   YYYY-MM-DD, default today
+
+        How it picks the serving:
+          1. If the food has a named serving matching `unit` exactly (e.g.
+             "1 oz" when unit=oz), use that with number_of_units=amount —
+             FS renders natively as "N oz".
+          2. Otherwise, convert `amount` to grams (or ml → grams for volume)
+             and use the metric gram serving with number_of_units=grams —
+             FS renders as "N g".
+
+        Preferred over `log_food` when the caller knows amount in absolute
+        units rather than "multiples of some specific serving." For named
+        portions ("1 cup", "half a stick") use `log_food` with the explicit
+        serving_id from `get_food`.
+        """
+        meal_key = MEAL_NORMALIZE.get(meal.lower())
+        if not meal_key:
+            raise RuntimeError(f"invalid meal: {meal!r}. Use Breakfast/Lunch/Dinner/Other (snack→Other).")
+
+        unit_norm = unit.lower().strip().replace(" ", "_")
+        if unit_norm in _WEIGHT_TO_G:
+            amount_g = float(amount) * _WEIGHT_TO_G[unit_norm]
+            dimension = "weight"
+        elif unit_norm in _VOLUME_TO_ML:
+            # Treat ml as grams for non-dense-liquid foods. Good enough for
+            # carnivore / whole-food logging. Dairy/oil will be ~5-10% off.
+            amount_g = float(amount) * _VOLUME_TO_ML[unit_norm]
+            dimension = "volume"
+        else:
+            raise RuntimeError(
+                f"unknown unit: {unit!r}. Supported: "
+                f"{', '.join(sorted(set(_WEIGHT_TO_G) | set(_VOLUME_TO_ML)))}"
+            )
+
+        info = client.call("food.get.v4", {"food_id": str(food_id)}).get("food") or {}
+        if not food_entry_name:
+            food_entry_name = info.get("food_name") or f"food {food_id}"
+        servings_list = (info.get("servings") or {}).get("serving") or []
+        if isinstance(servings_list, dict):
+            servings_list = [servings_list]
+        if not servings_list:
+            raise RuntimeError(f"food {food_id} has no servings defined")
+
+        # Try exact unit match: a serving whose measurement_description starts
+        # with the requested unit. FS often suffixes with prep info
+        # ("oz, boneless, raw") — those are serving metadata, not macro
+        # modifiers, so a prefix match is safe within one food.
+        named_match = None
+        metric_serving = None
+        for s in servings_list:
+            m = (s.get("measurement_description") or "").lower()
+            first_token = m.split(",")[0].split()[0] if m else ""
+            if first_token == "g":
+                metric_serving = s
+            if first_token == unit_norm or first_token == unit_norm.rstrip("s"):
+                if float(s.get("number_of_units") or 0) == 1.0:
+                    named_match = s
+                    break
+                if named_match is None:
+                    named_match = s
+
+        if named_match:
+            chosen = named_match
+            api_units = float(amount)  # units of measurement_description directly
+            how = f"{amount} {unit_norm}"
+        elif metric_serving:
+            chosen = metric_serving
+            api_units = amount_g  # grams directly — the "100 g" serving treats units as grams
+            how = f"{amount_g:.1f} g (converted from {amount} {unit_norm})"
+        else:
+            raise RuntimeError(
+                f"food {food_id} has neither a '{unit_norm}' serving nor a metric gram serving. "
+                f"Call get_food({food_id}) and use log_food with an explicit serving_id instead."
+            )
+
+        res = client.call("food_entry.create", {
+            "food_id": str(food_id),
+            "food_entry_name": food_entry_name,
+            "serving_id": str(chosen["serving_id"]),
+            "number_of_units": f"{api_units:.4f}".rstrip("0").rstrip("."),
+            "meal": meal_key,
+            "date": str(_date_int(date)),
+        })
+        fe = res.get("food_entry_id")
+        fe_id = fe.get("value") if isinstance(fe, dict) else fe
+        if not fe_id:
+            raise RuntimeError(f"FS returned no food_entry_id — unexpected response: {res}")
+        return (
+            f"logged (food_entry_id={fe_id}) {how} of {food_entry_name} "
+            f"to {meal_key} on {date or 'today'} "
+            f"(via serving '{chosen.get('serving_description')}', number_of_units={api_units})"
         )
 
     @mcp.tool()
