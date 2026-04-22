@@ -258,12 +258,10 @@ def _register_tools(mcp: FastMCP, client: Client) -> None:
         unit_norm = unit.lower().strip().replace(" ", "_")
         if unit_norm in _WEIGHT_TO_G:
             amount_g = float(amount) * _WEIGHT_TO_G[unit_norm]
-            dimension = "weight"
         elif unit_norm in _VOLUME_TO_ML:
             # Treat ml as grams for non-dense-liquid foods. Good enough for
             # carnivore / whole-food logging. Dairy/oil will be ~5-10% off.
             amount_g = float(amount) * _VOLUME_TO_ML[unit_norm]
-            dimension = "volume"
         else:
             raise RuntimeError(
                 f"unknown unit: {unit!r}. Supported: "
@@ -279,17 +277,20 @@ def _register_tools(mcp: FastMCP, client: Client) -> None:
         if not servings_list:
             raise RuntimeError(f"food {food_id} has no servings defined")
 
-        # Try exact unit match: a serving whose measurement_description starts
-        # with the requested unit. FS often suffixes with prep info
-        # ("oz, boneless, raw") — those are serving metadata, not macro
-        # modifiers, so a prefix match is safe within one food.
+        # Strategy:
+        # 1. If the food has a serving whose measurement_description starts
+        #    with the caller's unit (e.g. "oz" matches "oz, boneless, raw"),
+        #    use it directly — FS renders natively as "N <unit>".
+        # 2. Otherwise compute via grams. Every FS serving carries
+        #    metric_serving_amount + metric_serving_unit (usually g or oz).
+        #    Convert serving's metric to grams, derive grams-per-unit, and
+        #    compute api_number_of_units = desired_grams / grams_per_unit.
+        #    Works for "1 serving (85g)", "1 package (100g)", "1 jar (28g)",
+        #    and FS-encoded-in-oz servings like Whole Foods prepared items.
         named_match = None
-        metric_serving = None
         for s in servings_list:
             m = (s.get("measurement_description") or "").lower()
             first_token = m.split(",")[0].split()[0] if m else ""
-            if first_token == "g":
-                metric_serving = s
             if first_token == unit_norm or first_token == unit_norm.rstrip("s"):
                 if float(s.get("number_of_units") or 0) == 1.0:
                     named_match = s
@@ -299,16 +300,41 @@ def _register_tools(mcp: FastMCP, client: Client) -> None:
 
         if named_match:
             chosen = named_match
-            api_units = float(amount)  # units of measurement_description directly
+            api_units = float(amount)
             how = f"{amount} {unit_norm}"
-        elif metric_serving:
-            chosen = metric_serving
-            api_units = amount_g  # grams directly — the "100 g" serving treats units as grams
-            how = f"{amount_g:.1f} g (converted from {amount} {unit_norm})"
         else:
-            raise RuntimeError(
-                f"food {food_id} has neither a '{unit_norm}' serving nor a metric gram serving. "
-                f"Call get_food({food_id}) and use log_food with an explicit serving_id instead."
+            # Pick any serving with usable metric info; prefer ones with
+            # smaller metric_serving_amount (finer-grained granularity).
+            usable = []
+            for s in servings_list:
+                mu = (s.get("metric_serving_unit") or "").lower()
+                try:
+                    msa = float(s.get("metric_serving_amount") or 0)
+                    nu = float(s.get("number_of_units") or 0)
+                except ValueError:
+                    continue
+                if msa <= 0 or nu <= 0:
+                    continue
+                if mu == "g":
+                    grams_per_serving_unit = msa / nu
+                elif mu == "oz":
+                    grams_per_serving_unit = msa * 28.3495 / nu
+                elif mu == "ml":
+                    grams_per_serving_unit = msa / nu  # approx
+                else:
+                    continue
+                usable.append((grams_per_serving_unit, s))
+            if not usable:
+                raise RuntimeError(
+                    f"food {food_id} has no servings with usable metric info. "
+                    f"Call get_food({food_id}) + log_food with an explicit serving_id."
+                )
+            usable.sort()  # smallest grams-per-unit first → best precision
+            grams_per_unit, chosen = usable[0]
+            api_units = amount_g / grams_per_unit
+            how = (
+                f"{amount_g:.2f} g (from {amount} {unit_norm}) → "
+                f"{api_units:.3f}× '{chosen.get('serving_description')}'"
             )
 
         res = client.call("food_entry.create", {
