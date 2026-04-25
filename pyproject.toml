@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fatsecret-mcp"
-version = "0.1.1"
-description = "Model Context Protocol server for the FatSecret platform API (OAuth 1.0a user-scoped)."
+version = "0.2.0"
+description = "Model Context Protocol server for the FatSecret platform API (OAuth 1.0a user-scoped). Deployable as stdio (default) or SSE via mcp-proxy + Docker."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"

@@ -1,8 +1,12 @@
 # fatsecret-mcp
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template?template=https%3A%2F%2Fgithub.com%2Fmeimakes%2Ffatsecret-mcp)
+
 A Model Context Protocol (MCP) server for the [FatSecret Platform API](https://platform.fatsecret.com/platform-api), with OAuth 1.0a 3-legged user authentication so agents can read and write the authenticated user's food diary.
 
 Comes with an interactive setup command for the OAuth dance and handles a dozen or so FatSecret API quirks (wrong method names, metric-vs-named serving semantics, silent error envelopes, rejected meal values) so you don't have to.
+
+Speaks MCP over **stdio** by default, or **SSE** when run behind `mcp-proxy` (see [Deploy on Railway](#deploy-on-railway)).
 
 ## Install
 
@@ -90,6 +94,62 @@ If you'd rather not rely on the entry-point script:
   "args": ["-m", "fatsecret_mcp", "serve"]
 }
 ```
+
+## Deploy on Railway
+
+For agents that aren't on the same host as the FS config file (a hosted bot, a phone-side agent, multiple gateways sharing one tracker), deploy this as an SSE endpoint:
+
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template?template=https%3A%2F%2Fgithub.com%2Fmeimakes%2Ffatsecret-mcp)
+
+Click the button → Railway clones the repo, builds the included `Dockerfile`, and prompts you for the four FatSecret env vars below. Build wraps the stdio MCP in [`mcp-proxy`](https://github.com/sparfenyuk/mcp-proxy) and exposes `/sse` on Railway's `$PORT`.
+
+### Required env vars
+
+| Var | Where to get it |
+|-----|-----------------|
+| `FATSECRET_CONSUMER_KEY` | FatSecret dev console → API Keys → REST API OAuth 1.0 Credentials |
+| `FATSECRET_CONSUMER_SECRET` | same |
+| `FATSECRET_USER_TOKEN` | run `fatsecret-mcp auth` locally; copy `user_token` from `~/.config/fatsecret-mcp/config.json` |
+| `FATSECRET_USER_TOKEN_SECRET` | same; copy `user_token_secret` |
+
+### Connecting from your MCP client
+
+After deploy, Railway gives you a URL like `https://fatsecret-mcp-production-XXXX.up.railway.app`. Wire it into your MCP client:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "fatsecret": {
+        "url": "https://fatsecret-mcp-production-XXXX.up.railway.app/sse",
+        "transport": "sse"
+      }
+    }
+  }
+}
+```
+
+### Security posture
+
+This deployment is **single-user**: every caller on the URL writes to the FatSecret diary belonging to whichever user the env-var token came from. The Railway URL itself is unguessable (random subdomain) and is the gate — there's no per-call bearer auth out of the box. That's fine for "all my own agents are calling my own diary"; it's not fine for "anyone on the internet can call this." If you need stronger auth, put it behind Cloudflare Access / Tailscale Funnel, or run a small bearer-checking sidecar in front of `mcp-proxy`.
+
+For multi-user / per-caller-token setups, this package isn't the right shape — you'd want a different MCP that accepts a user-token header per call.
+
+### Local Docker
+
+Same image, runnable anywhere:
+
+```bash
+docker build -t fatsecret-mcp .
+docker run -p 8000:8000 \
+  -e FATSECRET_CONSUMER_KEY=... \
+  -e FATSECRET_CONSUMER_SECRET=... \
+  -e FATSECRET_USER_TOKEN=... \
+  -e FATSECRET_USER_TOKEN_SECRET=... \
+  fatsecret-mcp
+```
+
+Endpoint: `http://localhost:8000/sse`.
 
 ## Tools
 
