@@ -50,18 +50,22 @@ def cmd_serve(args: argparse.Namespace) -> int:
     from starlette.routing import Mount
     import uvicorn
 
-    class BearerAuthMiddleware(BaseHTTPMiddleware):
+    class BearerAuthMiddleware:
         def __init__(self, app, token: str):
-            super().__init__(app)
+            self.app = app
             self._token = token
 
-        async def dispatch(self, request, call_next):
-            # Allow CORS preflight unauthenticated; everything else requires bearer.
-            if request.method == "OPTIONS":
-                return await call_next(request)
-            if request.headers.get("authorization") != f"Bearer {self._token}":
-                return JSONResponse({"error": "unauthorized"}, status_code=401)
-            return await call_next(request)
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http":
+                headers = dict(scope.get("headers", []))
+                method = scope.get("method", "GET")
+                if method != "OPTIONS":
+                    auth = headers.get(b"authorization", b"").decode("utf-8")
+                    if auth != f"Bearer {self._token}":
+                        response = JSONResponse({"error": "unauthorized"}, status_code=401)
+                        await response(scope, receive, send)
+                        return
+            await self.app(scope, receive, send)
 
     if args.transport == "sse":
         mcp_app = server.sse_app()
