@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import json
 import os
@@ -29,26 +30,18 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # Hosted transports (sse / streamable-http).
     server.settings.host = args.host
     server.settings.port = args.port
-    # FastMCP's default DNS rebinding protection only allows localhost hosts.
-    # Disable for hosted deploys so external hostnames reach the endpoint.
     server.settings.transport_security.enable_dns_rebinding_protection = False
 
     auth_token = os.environ.get("MCP_AUTH_TOKEN", "").strip()
-    if not auth_token:
-        # No bearer token configured: run unauthenticated (URL-as-secret posture).
-        server.run(transport=args.transport)
-        return 0
 
-    # Bearer-auth mode: wrap FastMCP's ASGI app in a Starlette app whose
-    # middleware list is passed at construction time. (Calling
-    # `streamable_http_app().add_middleware()` after the fact doesn't take —
-    # FastMCP finalizes its own middleware stack before that runs.)
-    from starlette.applications import Starlette
-    from starlette.middleware import Middleware
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.responses import JSONResponse
-    from starlette.routing import Mount
-    import uvicorn
+    sse_app = server.sse_app()
+    http_app = server.streamable_http_app()
+
+    @contextlib.asynccontextmanager
+    async def combined_lifespan(_app):
+        async with sse_app.router.lifespan_context(sse_app):
+            async with http_app.router.lifespan_context(http_app):
+                yield
 
     class BearerAuthMiddleware:
         def __init__(self, app, token: str):
@@ -61,21 +54,35 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 method = scope.get("method", "GET")
                 if method != "OPTIONS":
                     auth = headers.get(b"authorization", b"").decode("utf-8")
-                    if auth != f"Bearer {self._token}":
+                    if self._token and auth != f"Bearer {self._token}":
                         response = JSONResponse({"error": "unauthorized"}, status_code=401)
                         await response(scope, receive, send)
                         return
+                    # Normalize Accept header for streamable HTTP compatibility
+                    accept = headers.get(b"accept", b"").decode("utf-8")
+                    if not accept or accept == "*/*":
+                        raw_headers = list(scope.get("headers", []))
+                        new_headers = [(k, v) for k, v in raw_headers if k.lower() != b"accept"]
+                        new_headers.append((b"accept", b"application/json, text/event-stream"))
+                        scope["headers"] = new_headers
             await self.app(scope, receive, send)
 
-    if args.transport == "sse":
-        mcp_app = server.sse_app()
-    else:  # streamable-http
-        mcp_app = server.streamable_http_app()
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.responses import JSONResponse
+    from starlette.routing import Mount
+    import uvicorn
+
+    middleware_list = [Middleware(BearerAuthMiddleware, token=auth_token)] if auth_token else []
 
     app = Starlette(
-        middleware=[Middleware(BearerAuthMiddleware, token=auth_token)],
-        routes=[Mount("/", app=mcp_app)],
-        lifespan=lambda _outer: mcp_app.router.lifespan_context(mcp_app),
+        middleware=middleware_list,
+        routes=[
+            Mount("/sse", app=sse_app),
+            Mount("/mcp", app=http_app),
+            Mount("/", app=http_app),
+        ],
+        lifespan=combined_lifespan,
     )
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
@@ -109,14 +116,14 @@ def cmd_auth(args: argparse.Namespace) -> int:
 
     cfg = Config(consumer=client.consumer, user_token=user_token)
     path = cfg.save()
-    print(f"\nSaved to {path} (mode 0600). You can now run `fatsecret-mcp serve`.")
+    print(f"\nSaved to {path} (mode 0600). You can now run .")
     return 0
 
 
 def cmd_whoami(args: argparse.Namespace) -> int:
     cfg = Config.load()
     if cfg.user_token is None:
-        print("no user token — run `fatsecret-mcp auth` first", file=sys.stderr)
+        print("no user token — run  first", file=sys.stderr)
         return 1
     client = Client(consumer=cfg.consumer, token=cfg.user_token)
     res = client.call("profile.get")
