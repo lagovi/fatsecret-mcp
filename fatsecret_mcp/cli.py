@@ -43,13 +43,42 @@ def cmd_serve(args: argparse.Namespace) -> int:
             async with http_app.router.lifespan_context(http_app):
                 yield
 
+    class CombinedMCPApp:
+        def __init__(self, sse, http):
+            self.sse = sse
+            self.http = http
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") == "http":
+                path = scope.get("path", "")
+                method = scope.get("method", "GET")
+
+                # POST / DELETE / PUT on /sse -> rewrite to /mcp for streamable HTTP handling
+                if path.startswith("/sse") and method in ("POST", "DELETE", "PUT"):
+                    scope_copy = dict(scope)
+                    scope_copy["path"] = "/mcp"
+                    await self.http(scope_copy, receive, send)
+                    return
+
+                if path in ("/sse", "/sse/", "/messages", "/messages/") or path.startswith("/messages"):
+                    await self.sse(scope, receive, send)
+                    return
+
+                if path.startswith("/mcp") or path == "/":
+                    scope_copy = dict(scope)
+                    scope_copy["path"] = "/mcp"
+                    await self.http(scope_copy, receive, send)
+                    return
+
+            await self.http(scope, receive, send)
+
     class BearerAuthMiddleware:
         def __init__(self, app, token: str):
             self.app = app
             self._token = token
 
         async def __call__(self, scope, receive, send):
-            if scope["type"] == "http":
+            if scope.get("type") == "http":
                 headers = dict(scope.get("headers", []))
                 method = scope.get("method", "GET")
                 if method != "OPTIONS":
@@ -70,20 +99,16 @@ def cmd_serve(args: argparse.Namespace) -> int:
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
     from starlette.responses import JSONResponse
-    from starlette.routing import Mount
     import uvicorn
 
+    combined_app = CombinedMCPApp(sse_app, http_app)
     middleware_list = [Middleware(BearerAuthMiddleware, token=auth_token)] if auth_token else []
 
     app = Starlette(
         middleware=middleware_list,
-        routes=[
-            Mount("/sse", app=sse_app),
-            Mount("/mcp", app=http_app),
-            Mount("/", app=http_app),
-        ],
         lifespan=combined_lifespan,
     )
+    app.mount("/", combined_app)
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
@@ -116,14 +141,14 @@ def cmd_auth(args: argparse.Namespace) -> int:
 
     cfg = Config(consumer=client.consumer, user_token=user_token)
     path = cfg.save()
-    print(f"\nSaved to {path} (mode 0600). You can now run .")
+    print(f"\nSaved to {path} (mode 0600). You can now run `fatsecret-mcp serve`.")
     return 0
 
 
 def cmd_whoami(args: argparse.Namespace) -> int:
     cfg = Config.load()
     if cfg.user_token is None:
-        print("no user token — run  first", file=sys.stderr)
+        print("no user token — run `fatsecret-mcp auth` first", file=sys.stderr)
         return 1
     client = Client(consumer=cfg.consumer, token=cfg.user_token)
     res = client.call("profile.get")
