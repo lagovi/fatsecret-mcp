@@ -20,7 +20,7 @@ This skill provides access to the FatSecret food database, diary logging, and nu
 2. **No Hallucinated IDs:** NEVER invent `food_id`, `serving_id`, `food_entry_id`, or `saved_meal_id`. Always look them up first.
 3. **Past Logging Works:** You CAN log food in the past. Use the `date` parameter (`YYYY-MM-DD`) in logging tools.
 4. **Favorites are Bookmarks:** `add_favorite` and `delete_favorite` only require `food_id`. They do not take portion parameters.
-5. **Custom Foods Disabled:** `create_custom_food` is a stub and currently unavailable.
+5. **Custom Foods Active:** `create_custom_food` allows creating user custom foods specifying name, calories, protein, fat, carbs.
 6. If a user says to add cookies, jam, pork, etc. without specifying details, use the basic products in English - cookies, jam, pork, etc.
 
 ## Tool Routing & Workflows

@@ -17,6 +17,7 @@ from mcp.server.fastmcp import FastMCP
 
 from .client import Client, FatSecretError
 from .config import Config
+from .web import web_client
 
 EPOCH = _dt.date(1970, 1, 1)
 MAX_DIARY_RANGE_DAYS = 31
@@ -496,23 +497,34 @@ def _register_tools(mcp: FastMCP, client: Client) -> None:
         if not meal_key:
             raise RuntimeError(f"invalid meal: {meal!r}. Use Breakfast/Lunch/Dinner/Other (snack→Other).")
 
-        info = client.call("food.get.v4", {"food_id": str(food_id)}).get("food") or {}
-        if not food_entry_name:
-            food_entry_name = info.get("food_name") or f"food {food_id}"
-        servings_list = (info.get("servings") or {}).get("serving") or []
-        if isinstance(servings_list, dict):
-            servings_list = [servings_list]
-        serving = next((s for s in servings_list if str(s.get("serving_id")) == str(serving_id)), None)
-        if not serving:
-            raise RuntimeError(f"serving_id {serving_id} not found on food {food_id}")
-        serving_units = float(serving.get("number_of_units") or 1)
-        serving_desc = serving.get("serving_description") or "?"
-        api_units = float(servings) * serving_units
+        try:
+            info = client.call("food.get.v4", {"food_id": str(food_id)}).get("food") or {}
+            if not food_entry_name:
+                food_entry_name = info.get("food_name") or f"food {food_id}"
+            servings_list = (info.get("servings") or {}).get("serving") or []
+            if isinstance(servings_list, dict):
+                servings_list = [servings_list]
+            serving = next((s for s in servings_list if str(s.get("serving_id")) == str(serving_id)), None)
+            if not serving:
+                raise RuntimeError(f"serving_id {serving_id} not found on food {food_id}")
+            serving_units = float(serving.get("number_of_units") or 1)
+            serving_desc = serving.get("serving_description") or "?"
+            api_units = float(servings) * serving_units
+            target_serving_id = str(serving_id)
+        except FatSecretError as e:
+            if e.code == 106:
+                target_serving_id = "0"
+                serving_desc = "custom serving"
+                api_units = float(servings)
+                if not food_entry_name:
+                    food_entry_name = f"Custom Food {food_id}"
+            else:
+                raise
 
         res = client.call("food_entry.create", {
             "food_id": str(food_id),
             "food_entry_name": food_entry_name,
-            "serving_id": str(serving_id),
+            "serving_id": target_serving_id,
             "number_of_units": f"{api_units:.4f}".rstrip("0").rstrip("."),
             "meal": meal_key,
             "date": str(_date_int(date)),
@@ -554,67 +566,83 @@ def _register_tools(mcp: FastMCP, client: Client) -> None:
                 f"{', '.join(sorted(set(_WEIGHT_TO_G) | set(_VOLUME_TO_ML)))}"
             )
 
-        info = client.call("food.get.v4", {"food_id": str(food_id)}).get("food") or {}
-        if not food_entry_name:
-            food_entry_name = info.get("food_name") or f"food {food_id}"
-        servings_list = (info.get("servings") or {}).get("serving") or []
-        if isinstance(servings_list, dict):
-            servings_list = [servings_list]
-        if not servings_list:
-            raise RuntimeError(f"food {food_id} has no servings defined")
+        try:
+            info = client.call("food.get.v4", {"food_id": str(food_id)}).get("food") or {}
+            if not food_entry_name:
+                food_entry_name = info.get("food_name") or f"food {food_id}"
+            servings_list = (info.get("servings") or {}).get("serving") or []
+            if isinstance(servings_list, dict):
+                servings_list = [servings_list]
+            if not servings_list:
+                raise RuntimeError(f"food {food_id} has no servings defined")
+            is_custom = False
+        except FatSecretError as e:
+            if e.code == 106:
+                is_custom = True
+                if not food_entry_name:
+                    food_entry_name = f"Custom Food {food_id}"
+            else:
+                raise
 
-        named_match = None
-        for s in servings_list:
-            m = (s.get("measurement_description") or "").lower()
-            first_token = m.split(",")[0].split()[0] if m else ""
-            if first_token == unit_norm or first_token == unit_norm.rstrip("s"):
-                if float(s.get("number_of_units") or 0) == 1.0:
-                    named_match = s
-                    break
-                if named_match is None:
-                    named_match = s
-
-        if named_match:
-            chosen = named_match
-            api_units = float(amount)
-            how = f"{amount} {unit_norm}"
+        if is_custom:
+            chosen = {"serving_description": "100g custom serving"}
+            chosen_serving_id = "0"
+            api_units = amount_g / 100.0
+            how = f"{amount_g:.2f} g -> {api_units:.3f}x custom serving (100g)"
         else:
-            usable = []
+            named_match = None
             for s in servings_list:
-                mu = (s.get("metric_serving_unit") or "").lower()
-                try:
-                    msa = float(s.get("metric_serving_amount") or 0)
-                    nu = float(s.get("number_of_units") or 0)
-                except ValueError:
-                    continue
-                if msa <= 0 or nu <= 0:
-                    continue
-                if mu == "g":
-                    grams_per_serving_unit = msa / nu
-                elif mu == "oz":
-                    grams_per_serving_unit = msa * 28.3495 / nu
-                elif mu == "ml":
-                    grams_per_serving_unit = msa / nu
-                else:
-                    continue
-                usable.append((grams_per_serving_unit, s))
-            if not usable:
-                raise RuntimeError(
-                    f"food {food_id} has no servings with usable metric info. "
-                    f"Call get_food({food_id}) + log_food with an explicit serving_id."
+                m = (s.get("measurement_description") or "").lower()
+                first_token = m.split(",")[0].split()[0] if m else ""
+                if first_token == unit_norm or first_token == unit_norm.rstrip("s"):
+                    if float(s.get("number_of_units") or 0) == 1.0:
+                        named_match = s
+                        break
+                    if named_match is None:
+                        named_match = s
+
+            if named_match:
+                chosen = named_match
+                api_units = float(amount)
+                how = f"{amount} {unit_norm}"
+            else:
+                usable = []
+                for s in servings_list:
+                    mu = (s.get("metric_serving_unit") or "").lower()
+                    try:
+                        msa = float(s.get("metric_serving_amount") or 0)
+                        nu = float(s.get("number_of_units") or 0)
+                    except ValueError:
+                        continue
+                    if msa <= 0 or nu <= 0:
+                        continue
+                    if mu == "g":
+                        grams_per_serving_unit = msa / nu
+                    elif mu == "oz":
+                        grams_per_serving_unit = msa * 28.3495 / nu
+                    elif mu == "ml":
+                        grams_per_serving_unit = msa / nu
+                    else:
+                        continue
+                    usable.append((grams_per_serving_unit, s))
+                if not usable:
+                    raise RuntimeError(
+                        f"food {food_id} has no servings with usable metric info. "
+                        f"Call get_food({food_id}) + log_food with an explicit serving_id."
+                    )
+                usable.sort()
+                grams_per_unit, chosen = usable[0]
+                api_units = amount_g / grams_per_unit
+                how = (
+                    f"{amount_g:.2f} g (from {amount} {unit_norm}) → "
+                    f"{api_units:.3f}× '{chosen.get('serving_description')}'"
                 )
-            usable.sort()
-            grams_per_unit, chosen = usable[0]
-            api_units = amount_g / grams_per_unit
-            how = (
-                f"{amount_g:.2f} g (from {amount} {unit_norm}) → "
-                f"{api_units:.3f}× '{chosen.get('serving_description')}'"
-            )
+            chosen_serving_id = str(chosen["serving_id"])
 
         res = client.call("food_entry.create", {
             "food_id": str(food_id),
             "food_entry_name": food_entry_name,
-            "serving_id": str(chosen["serving_id"]),
+            "serving_id": chosen_serving_id,
             "number_of_units": f"{api_units:.4f}".rstrip("0").rstrip("."),
             "meal": meal_key,
             "date": str(_date_int(date)),
@@ -658,59 +686,22 @@ def _register_tools(mcp: FastMCP, client: Client) -> None:
     @mcp.tool()
     def create_custom_food(
         name: str,
-        brand: str = "",
-        calories: float = 0,
+        calories: float,
         protein: float = 0,
         fat: float = 0,
         carbs: float = 0,
-        serving_size: str = "1 serving",
-        serving_amount: float | None = None,
-        serving_amount_unit: str = "g",
-        brand_type: str = "manufacturer",
-        calories_from_fat: float | None = None,
-        saturated_fat: float | None = None,
-        polyunsaturated_fat: float | None = None,
-        monounsaturated_fat: float | None = None,
-        trans_fat: float | None = None,
-        cholesterol: float | None = None,
-        sodium: float | None = None,
-        potassium: float | None = None,
-        fiber: float | None = None,
-        sugar: float | None = None,
-        added_sugars: float | None = None,
-        vitamin_d: float | None = None,
-        vitamin_a: float | None = None,
-        vitamin_c: float | None = None,
-        calcium: float | None = None,
-        iron: float | None = None,
+        brand: str = "",
+        serving_size: str = "100 g",
     ) -> str:
-        """Create a custom food through FatSecret's Premier-only v2 method."""
-        return json.dumps(_create_custom_food(
-            client,
+        """Create a custom food item on FatSecret using automated web integration.
+        Returns created food_id and nutritional details."""
+        res = web_client.create_custom_food(
             name=name,
-            brand=brand,
             calories=calories,
             protein=protein,
             fat=fat,
             carbs=carbs,
+            brand=brand,
             serving_size=serving_size,
-            serving_amount=serving_amount,
-            serving_amount_unit=serving_amount_unit,
-            brand_type=brand_type,
-            calories_from_fat=calories_from_fat,
-            saturated_fat=saturated_fat,
-            polyunsaturated_fat=polyunsaturated_fat,
-            monounsaturated_fat=monounsaturated_fat,
-            trans_fat=trans_fat,
-            cholesterol=cholesterol,
-            sodium=sodium,
-            potassium=potassium,
-            fiber=fiber,
-            sugar=sugar,
-            added_sugars=added_sugars,
-            vitamin_d=vitamin_d,
-            vitamin_a=vitamin_a,
-            vitamin_c=vitamin_c,
-            calcium=calcium,
-            iron=iron,
-        ), indent=2)
+        )
+        return json.dumps(res, indent=2)
