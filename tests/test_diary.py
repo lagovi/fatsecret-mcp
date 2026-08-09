@@ -5,7 +5,7 @@ import datetime as dt
 import pytest
 
 from fatsecret_mcp.client import FatSecretError
-from fatsecret_mcp.server import EPOCH, _day_diary, _diary_range, _replace_entry
+from fatsecret_mcp.server import EPOCH, _day_diary, _diary_range, _update_diary_entry
 
 
 class FakeClient:
@@ -190,10 +190,10 @@ def test_diary_range_validates_order_and_length():
         _diary_range(client, dt.date(2026, 1, 1), dt.date(2026, 2, 1))
 
 
-def test_replace_entry_uses_one_native_edit_call():
+def test_update_diary_entry_uses_one_native_edit_call():
     client = FakeClient({"food_entry.edit": {"success": {"value": "1"}}})
 
-    result = _replace_entry(
+    result = _update_diary_entry(
         client,
         food_entry_id="123",
         serving_id="5041",
@@ -219,8 +219,8 @@ def test_replace_entry_uses_one_native_edit_call():
     })]
 
 
-def test_replace_entry_rejects_invalid_units_without_calling_api():
+def test_update_diary_entry_rejects_invalid_units_without_calling_api():
     client = FakeClient({})
     with pytest.raises(RuntimeError, match="positive finite"):
-        _replace_entry(client, "123", "5041", float("nan"))
+        _update_diary_entry(client, "123", "5041", float("nan"))
     assert client.calls == []

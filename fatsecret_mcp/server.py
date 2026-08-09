@@ -100,27 +100,6 @@ _VOLUME_TO_ML = {
 }
 
 
-def _local_custom_foods_path() -> pathlib.Path:
-    base = pathlib.Path.home() / ".config" / "fatsecret-mcp"
-    base.mkdir(parents=True, exist_ok=True)
-    return base / "custom_foods.json"
-
-
-def _load_local_custom_foods() -> list[dict[str, Any]]:
-    p = _local_custom_foods_path()
-    if p.exists():
-        try:
-            return json.loads(p.read_text())
-        except Exception:
-            pass
-    return []
-
-
-def _save_local_custom_foods(foods: list[dict[str, Any]]) -> None:
-    p = _local_custom_foods_path()
-    p.write_text(json.dumps(foods, indent=2, ensure_ascii=False))
-
-
 def build_server() -> FastMCP:
     cfg = Config.load()
     if cfg.user_token is None:
@@ -287,7 +266,7 @@ def _diary_range(client: Client, start: _dt.date, end: _dt.date) -> dict[str, An
     }
 
 
-def _replace_entry(
+def _update_diary_entry(
     client: Client,
     food_entry_id: str,
     serving_id: str,
@@ -337,146 +316,19 @@ def _custom_food_decimal(value: Any, field: str) -> str:
     return f"{number:.6f}".rstrip("0").rstrip(".") or "0"
 
 
-def _create_custom_food(
-    client: Client,
-    *,
-    name: str,
-    brand: str = "",
-    calories: float = 0,
-    protein: float = 0,
-    fat: float = 0,
-    carbs: float = 0,
-    serving_size: str = "1 serving",
-    serving_amount: float | None = None,
-    serving_amount_unit: str = "g",
-    brand_type: str = "manufacturer",
-    calories_from_fat: float | None = None,
-    saturated_fat: float | None = None,
-    polyunsaturated_fat: float | None = None,
-    monounsaturated_fat: float | None = None,
-    trans_fat: float | None = None,
-    cholesterol: float | None = None,
-    sodium: float | None = None,
-    potassium: float | None = None,
-    fiber: float | None = None,
-    sugar: float | None = None,
-    added_sugars: float | None = None,
-    vitamin_d: float | None = None,
-    vitamin_a: float | None = None,
-    vitamin_c: float | None = None,
-    calcium: float | None = None,
-    iron: float | None = None,
-) -> dict[str, Any]:
-    food_name = name.strip()
-    if not food_name:
-        raise RuntimeError("name must not be blank")
-    serving_description = serving_size.strip()
-    if not serving_description:
-        raise RuntimeError("serving_size must not be blank")
-
-    normalized_brand_type = brand_type.lower().strip()
-    if normalized_brand_type not in _CUSTOM_FOOD_BRAND_TYPES:
-        allowed = ", ".join(sorted(_CUSTOM_FOOD_BRAND_TYPES))
-        raise RuntimeError(f"brand_type must be one of: {allowed}")
-
-    params = {
-        "brand_type": normalized_brand_type,
-        "food_name": food_name,
-        "serving_size": serving_description,
-        "calories": _custom_food_decimal(calories, "calories"),
-        "fat": _custom_food_decimal(fat, "fat"),
-        "carbohydrate": _custom_food_decimal(carbs, "carbs"),
-        "protein": _custom_food_decimal(protein, "protein"),
-    }
-    brand_name = brand.strip()
-    if brand_name:
-        params["brand_name"] = brand_name
-
-    if serving_amount is not None:
-        try:
-            amount = float(serving_amount)
-        except (TypeError, ValueError):
-            raise RuntimeError("serving_amount must be a positive finite number") from None
-        if not math.isfinite(amount) or amount <= 0:
-            raise RuntimeError("serving_amount must be a positive finite number")
-        normalized_unit = serving_amount_unit.lower().strip()
-        if normalized_unit not in _CUSTOM_FOOD_SERVING_UNITS:
-            allowed = ", ".join(sorted(_CUSTOM_FOOD_SERVING_UNITS))
-            raise RuntimeError(f"serving_amount_unit must be one of: {allowed}")
-        params["serving_amount"] = f"{amount:.6f}".rstrip("0").rstrip(".")
-        params["serving_amount_unit"] = normalized_unit
-
-    optional_nutrients = {
-        "calories_from_fat": calories_from_fat,
-        "saturated_fat": saturated_fat,
-        "polyunsaturated_fat": polyunsaturated_fat,
-        "monounsaturated_fat": monounsaturated_fat,
-        "trans_fat": trans_fat,
-        "cholesterol": cholesterol,
-        "sodium": sodium,
-        "potassium": potassium,
-        "fiber": fiber,
-        "sugar": sugar,
-        "added_sugars": added_sugars,
-        "vitamin_d": vitamin_d,
-        "vitamin_a": vitamin_a,
-        "vitamin_c": vitamin_c,
-        "calcium": calcium,
-        "iron": iron,
-    }
-    for field in _CUSTOM_FOOD_OPTIONAL_NUTRIENTS:
-        value = optional_nutrients[field]
-        if value is not None:
-            params[field] = _custom_food_decimal(value, field)
-
-    try:
-        res = client.call("food.create.v2", params)
-    except FatSecretError as e:
-        return {
-            "created": False,
-            "error": "premier_required",
-            "message": (
-                "FatSecret custom-food creation is Premier Exclusive, and this "
-                "developer app does not have access to food.create.v2. Upgrade the "
-                "app's FatSecret Platform edition, then retry the same request."
-            ),
-            "fatsecret_error": {"code": e.code, "message": e.message},
-        }
-
-    food_id = res.get("food_id")
-    food_id = food_id.get("value") if isinstance(food_id, dict) else food_id
-    if not food_id:
-        raise RuntimeError(f"FS returned no food_id — unexpected response: {res}")
-    return {
-        "created": True,
-        "food_id": str(food_id),
-        "food_name": food_name,
-        "brand_name": brand_name or None,
-        "serving_size": serving_description,
-    }
-
-
 def _register_tools(mcp: FastMCP, client: Client) -> None:
     # ---- public food DB & local custom db ----------------------------------
 
     @mcp.tool()
     def search_food(query: str, max_results: int = 10) -> str:
-        """Search food database by name/brand (includes local custom products)."""
+        """Search food database by name/brand.
+        IMPORTANT: The API only supports the USA region and English language.
+        You MUST translate all user queries (e.g., Russian/Cyrillic) to English before searching.
+        Always use this before getting details or logging."""
         max_results = max(1, min(50, int(max_results)))
         lines = []
 
-        local_foods = _load_local_custom_foods()
-        query_lower = query.lower()
-        matched_local = [
-            f for f in local_foods
-            if query_lower in f.get("name", "").lower() or query_lower in f.get("brand", "").lower()
-        ]
-        for f in matched_local[:max_results]:
-            brand_tag = f" [{f['brand']}]" if f.get("brand") else ""
-            desc = f"Per {f.get('serving_size', '100g')} - Calories: {f.get('calories', 0)}kcal | Fat: {f.get('fat', 0)}g | Carbs: {f.get('carbs', 0)}g | Protein: {f.get('protein', 0)}g"
-            lines.append(f"- [custom:{f.get('id')}] (LOCAL) {f.get('name')}{brand_tag}  {desc}")
-
-        remaining_slots = max_results - len(lines)
+        remaining_slots = max_results
         if remaining_slots > 0:
             res = client.call("foods.search", {"search_expression": query, "max_results": str(remaining_slots)})
             foods = (res.get("foods") or {}).get("food") or []
@@ -491,17 +343,10 @@ def _register_tools(mcp: FastMCP, client: Client) -> None:
         return "\n".join(lines)
 
     @mcp.tool()
-    def get_food(food_id: str) -> str:
-        """Full macros + every available serving for a food."""
-        if str(food_id).startswith("custom:"):
-            cid = str(food_id).replace("custom:", "")
-            local_foods = _load_local_custom_foods()
-            found = next((f for f in local_foods if str(f.get("id")) == cid), None)
-            if not found:
-                return f"local custom food not found: {food_id}"
-            header = f"(LOCAL) {found.get('name', '')}" + (f" [{found.get('brand')}]" if found.get('brand') else "")
-            lines = [header, f"  [serving_id local_1] {found.get('serving_size', '100g')}: {found.get('calories', 0)} cal, P{found.get('protein', 0)} F{found.get('fat', 0)} C{found.get('carbs', 0)}"]
-            return "\n".join(lines)
+    def get_food_details(food_id: str | int) -> str:
+        """Get full macros and ALL available serving_id options for a specific food.
+        REQUIRES: food_id obtained strictly from search_food."""
+        
 
         res = client.call("food.get.v4", {"food_id": str(food_id)})
         food = res.get("food")
@@ -538,8 +383,9 @@ def _register_tools(mcp: FastMCP, client: Client) -> None:
         return "\n".join(lines)
 
     @mcp.tool()
-    def get_saved_meal_details(saved_meal_id: str) -> str:
-        """Get ingredient breakdown of a saved meal by saved_meal_id."""
+    def get_saved_meal_details(saved_meal_id: str | int) -> str:
+        """Get ingredient breakdown of a saved meal.
+        REQUIRES: saved_meal_id obtained from get_saved_meals."""
         res = client.call("saved_meal_items.get.v2", {"saved_meal_id": str(saved_meal_id)})
         items = (res.get("saved_meal_items") or {}).get("saved_meal_item") or []
         if isinstance(items, dict):
@@ -553,7 +399,8 @@ def _register_tools(mcp: FastMCP, client: Client) -> None:
 
     @mcp.tool()
     def log_saved_meal(saved_meal_id: str, meal: str = "Breakfast", date: str = "") -> str:
-        """Log an entire saved meal (Favorite Meal) to the user's diary."""
+        """Log an entire saved meal (Favorite Meal) to the user's diary.
+        REQUIRES: saved_meal_id obtained from get_saved_meals."""
         meal_key = MEAL_NORMALIZE.get(meal.lower())
         if not meal_key:
             raise RuntimeError(f"invalid meal: {meal!r}. Use Breakfast/Lunch/Dinner/Other.")
@@ -587,76 +434,20 @@ def _register_tools(mcp: FastMCP, client: Client) -> None:
         return "\n".join(lines)
 
     @mcp.tool()
-    def add_favorite(food_id: str, serving_id: str = "", number_of_units: float = 1.0) -> str:
-        """Add a food item to user's favorites."""
-        params = {"food_id": str(food_id)}
-        if serving_id:
-            params["serving_id"] = str(serving_id)
-            params["number_of_units"] = str(number_of_units)
-        res = client.call("food.add_favorite", params)
+    def add_favorite(food_id: str | int) -> str:
+        """Add a food item to user's favorites.
+        REQUIRES: food_id obtained strictly from search_food."""
+        client.call("food.add_favorite", {"food_id": str(food_id)})
         return f"added food_id {food_id} to favorites"
 
     @mcp.tool()
-    def delete_favorite(food_id: str, serving_id: str = "", number_of_units: float = 1.0) -> str:
-        """Delete a food item from user's favorites."""
-        params = {"food_id": str(food_id)}
-        if serving_id:
-            params["serving_id"] = str(serving_id)
-            params["number_of_units"] = str(number_of_units)
-        res = client.call("food.delete_favorite", params)
+    def delete_favorite(food_id: str | int) -> str:
+        """Delete a food item from user's favorites.
+        REQUIRES: food_id obtained strictly from get_favorites."""
+        client.call("food.delete_favorite", {"food_id": str(food_id)})
         return f"removed food_id {food_id} from favorites"
 
     # ---- Local Custom Foods Management -----------------------------------
-
-    @mcp.tool()
-    def add_custom_food_local(
-        name: str,
-        brand: str = "",
-        calories: float = 0,
-        protein: float = 0,
-        fat: float = 0,
-        carbs: float = 0,
-        serving_size: str = "100g",
-    ) -> str:
-        """Add a custom product to local JSON database (~/.config/fatsecret-mcp/custom_foods.json)."""
-        foods = _load_local_custom_foods()
-        new_id = str(len(foods) + 1)
-        item = {
-            "id": new_id,
-            "name": name.strip(),
-            "brand": brand.strip(),
-            "calories": float(calories),
-            "protein": float(protein),
-            "fat": float(fat),
-            "carbs": float(carbs),
-            "serving_size": serving_size.strip(),
-        }
-        foods.append(item)
-        _save_local_custom_foods(foods)
-        return f"saved local custom food [custom:{new_id}] {name} ({serving_size}: {calories} cal, P{protein} F{fat} C{carbs})"
-
-    @mcp.tool()
-    def get_custom_foods_local() -> str:
-        """List all custom products stored in local JSON database."""
-        foods = _load_local_custom_foods()
-        if not foods:
-            return "no local custom foods stored"
-        lines = ["=== Local Custom Foods ==="]
-        for f in foods:
-            brand_tag = f" [{f['brand']}]" if f.get("brand") else ""
-            lines.append(f"- [custom:{f.get('id')}] {f.get('name')}{brand_tag} ({f.get('serving_size')}): {f.get('calories')} cal, P{f.get('protein')} F{f.get('fat')} C{f.get('carbs')}")
-        return "\n".join(lines)
-
-    @mcp.tool()
-    def delete_custom_food_local(custom_id: str) -> str:
-        """Delete a local custom product by ID (e.g. '1' or 'custom:1')."""
-        cid = str(custom_id).replace("custom:", "").strip()
-        foods = _load_local_custom_foods()
-        filtered = [f for f in foods if str(f.get("id")) != cid]
-        if len(filtered) == len(foods):
-            return f"custom food with id {custom_id} not found"
-        _save_local_custom_foods(filtered)
-        return f"deleted local custom food id {custom_id}"
 
     # ---- user diary --------------------------------------------------------
 
@@ -664,11 +455,21 @@ def _register_tools(mcp: FastMCP, client: Client) -> None:
     def get_profile() -> str:
         """Get the authenticated user's FS profile (height, weight, goal)."""
         res = client.call("profile.get")
-        return json.dumps(res.get("profile", {}), indent=2)
+        profile = res.get("profile", {})
+        if "last_weight_date_int" in profile:
+            try:
+                days = int(profile["last_weight_date_int"])
+                import datetime as _dt_local
+                epoch = _dt_local.date(1970, 1, 1)
+                profile["last_weight_date"] = (epoch + _dt_local.timedelta(days=days)).isoformat()
+            except Exception:
+                pass
+        return json.dumps(profile, indent=2)
 
     @mcp.tool()
     def get_diary(date: str = "") -> str:
-        """Get one day's diary as structured JSON (YYYY-MM-DD, default today)."""
+        """Get diary entries for a specific date (YYYY-MM-DD). Defaults to today.
+        Always run this before using update_diary_entry or delete_diary_entry to get the correct food_entry_id."""
         day = _dt.date.fromisoformat(date) if date else _dt.date.today()
         return json.dumps(_day_diary(client, day), indent=2)
 
@@ -680,7 +481,7 @@ def _register_tools(mcp: FastMCP, client: Client) -> None:
         return json.dumps(_diary_range(client, start, end), indent=2)
 
     @mcp.tool()
-    def log_food(
+    def log_food_by_serving(
         food_id: str,
         serving_id: str,
         servings: float,
@@ -688,7 +489,9 @@ def _register_tools(mcp: FastMCP, client: Client) -> None:
         date: str = "",
         food_entry_name: str = "",
     ) -> str:
-        """Log a food to the user's diary."""
+        """Log a specific portion of food.
+        REQUIRES: food_id (MUST be from search_food) and serving_id (MUST be from get_food_details).
+        Do not guess serving_id. If you only know the weight in grams/ml, use log_food_by_amount instead."""
         meal_key = MEAL_NORMALIZE.get(meal.lower())
         if not meal_key:
             raise RuntimeError(f"invalid meal: {meal!r}. Use Breakfast/Lunch/Dinner/Other (snack→Other).")
@@ -725,7 +528,7 @@ def _register_tools(mcp: FastMCP, client: Client) -> None:
         )
 
     @mcp.tool()
-    def log_amount(
+    def log_food_by_amount(
         food_id: str,
         amount: float,
         unit: str = "g",
@@ -733,7 +536,9 @@ def _register_tools(mcp: FastMCP, client: Client) -> None:
         date: str = "",
         food_entry_name: str = "",
     ) -> str:
-        """Log a food by absolute amount + unit — no need to pre-pick a serving."""
+        """Log food by absolute weight or volume (e.g., grams, ml, oz).
+        REQUIRES: food_id (MUST be from search_food).
+        Workflow: search_food -> log_food_by_amount."""
         meal_key = MEAL_NORMALIZE.get(meal.lower())
         if not meal_key:
             raise RuntimeError(f"invalid meal: {meal!r}. Use Breakfast/Lunch/Dinner/Other (snack→Other).")
@@ -825,15 +630,16 @@ def _register_tools(mcp: FastMCP, client: Client) -> None:
         )
 
     @mcp.tool()
-    def replace_entry(
+    def update_diary_entry(
         food_entry_id: str,
         serving_id: str,
         number_of_units: float,
         meal: str = "",
         food_entry_name: str = "",
     ) -> str:
-        """Atomically replace an entry's serving and amount via food_entry.edit."""
-        return json.dumps(_replace_entry(
+        """Modify an existing diary entry.
+        REQUIRES: food_entry_id. You MUST call get_diary first to find the correct food_entry_id. Never guess IDs."""
+        return json.dumps(_update_diary_entry(
             client,
             food_entry_id=food_entry_id,
             serving_id=serving_id,
@@ -843,8 +649,9 @@ def _register_tools(mcp: FastMCP, client: Client) -> None:
         ), indent=2)
 
     @mcp.tool()
-    def delete_entry(food_entry_id: str) -> str:
-        """Delete a diary entry by food_entry_id (from get_diary)."""
+    def delete_diary_entry(food_entry_id: str | int) -> str:
+        """Delete a diary entry.
+        REQUIRES: food_entry_id. You MUST call get_diary first to find the correct food_entry_id."""
         client.call("food_entry.delete", {"food_entry_id": str(food_entry_id)})
         return f"deleted entry {food_entry_id}"
 
